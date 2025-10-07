@@ -13,14 +13,43 @@ import logging
 import os
 
 
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+import json
 
 
+import re
 
+def extract_json_from_llm_output(text: str) -> dict:
+    """
+    Extracts JSON from a string that may be wrapped in Markdown code blocks.
+    Handles:
+      - ```json{...}```
+      - ```{...}```
+      - Plain {...}
+    """
+    # Remove Markdown code block wrappers
+    json_match = re.search(r"```(?:json)?\s*({.*})\s*```", text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1)
+    else:
+        # Fallback: assume the whole string is JSON
+        json_str = text.strip()
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse LLM JSON output: {e}")
 
 
 # Optional: enable structured logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Optional: Define a Pydantic model for your LLM response (recommended!)
+class LLMAnalysisResponse(BaseModel):
+    project_analysis: dict
+    ci_pipeline_steps: list
 
 app = FastAPI(
     title="Repo Analyzer API",
@@ -58,7 +87,7 @@ class RepoAnalysisRequest(BaseModel):
     max_lines: int = Field(
         300,
         ge=10,
-        le=1000,
+        le=100000,
         example=300,
         description="Max lines to retain for large lockfiles."
     )
@@ -97,7 +126,7 @@ LARGE_FILE_SUFFIXES = (".lock", "package-lock.json", "yarn.lock", "pnpm-lock.yam
 # --- Main Endpoint ---
 @app.post(
     "/analyze",
-    response_model=Dict[str, str],
+    response_model=LLMAnalysisResponse,
     summary="Analyze GitHub repository contents",
     description="""
     Fetches and filters relevant CI/CD and dependency files from a GitHub repository.
@@ -190,5 +219,62 @@ def analyze_repo(request: RepoAnalysisRequest):
             content = "\n".join(selected_lines[:request.max_lines])
 
         results[filepath] = content
+  
 
-    return results
+    
+    snapshot_str = content
+    
+
+
+    repodetails_str = "https://github.com/ubaimutl/react-portfolio.git master branch"
+    llm = ChatGoogleGenerativeAI(
+        api_key="AIzaSyDjSMkvmTaesnYoeXQPs5T79iR2ba4mX9Q"
+        ,model="gemini-2.5-pro", temperature=0.1
+    )
+
+
+    prompt = [
+    SystemMessage(content=(
+        "You are an expert DevOps engineer specializing in CI pipeline generation. "
+        "strictly ci steps only."
+        "Your task is to analyze repository files and output a STRICTLY VALID JSON object with NO extra text, "
+        "markdown, or explanations. The output will be parsed programmatically for a drag-and-drop pipeline builder."
+    )),
+    HumanMessage(content=(
+        f"Analyze the following repository snapshot and details:\n\n"
+        f"--- REPOSITORY SNAPSHOT ---\n{snapshot_str}\n\n"
+        f"--- REPO METADATA ---\n{repodetails_str}\n\n"
+        "Generate a JSON object with EXACTLY these top-level keys:\n"
+        "1. `project_analysis`: Object with repo_url, branch should be as per the details provided, tech_stack (with versions), project_type, runtime_versions\n"
+        "2. `ci_pipeline_steps`: Array of step objects for drag-and-drop pipeline builder\n\n"
+        "RULES FOR `ci_pipeline_steps`:\n"
+        "- Each step MUST have: id (snake_case), name, description, category (Setup/Build/Test/Deploy/Optimization), default_command\n"
+        "- Each step MAY have: optional (boolean), make each step generic but the verison of packages must be included along with runtime versions can be aproxed just the steps are generic and this is just sekelton of steps and info to genrate the pipeline\n"
+        "- NO markdown, NO code blocks, NO extra fields\n"
+        "- list of the steps in order that is recommened for users clarity\n"
+        "- Commands must be executable in shell (e.g., 'npm ci', not 'Install dependencies')\n\n"
+        "OUTPUT FORMAT:\n"
+        "{\n"
+        "  \"project_analysis\": { ... },\n"
+        "  \"ci_pipeline_steps\": [\n"
+        "    {\n"
+        "      \"id\": \"string\",\n"
+        "      \"name\": \"string\",\n"
+        "      \"description\": \"string\",\n"
+        "      \"category\": \"string\",\n"
+        "      \"default_command\": \"string\",\n"
+        "      \"optional\": boolean,\n"
+       
+        "      }\n"
+        "    }\n"
+        "  ],\n"
+       "\n"
+        "IMPORTANT: Output ONLY the JSON object. NO prefixes, NO suffixes, NO ```json blocks."
+    ))
+        ]
+
+    response = llm.invoke(prompt)
+    print(response.content)
+    
+
+    return extract_json_from_llm_output(response.content)
