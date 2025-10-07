@@ -2,7 +2,7 @@ from fastapi import FastAPI
 import requests
 import os
 import base64
-from typing import Dict
+from typing import Dict ,List
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, validator
 from typing import Dict, Optional
@@ -278,3 +278,69 @@ def analyze_repo(request: RepoAnalysisRequest):
     
 
     return extract_json_from_llm_output(response.content)
+
+
+class TechItem(BaseModel):
+    name: str
+    version: str
+
+class ProjectAnalysisInput(BaseModel):
+    repo_url: str
+    branch: str
+    tech_stack: List[TechItem]
+    project_type: str
+    runtime_versions: List[TechItem]
+
+class PipelineStepInput(BaseModel):
+    id: str
+    name: str
+    description: str
+    category: str
+    default_command: str
+    optional: bool
+    # Note: platform_specific_plugins NOT needed here — we generate GitHub Actions only
+
+class PipelineGenerationRequest(BaseModel):
+    project_analysis: ProjectAnalysisInput
+    ci_pipeline_steps: List[PipelineStepInput] = Field(
+        ...,
+        description="User-selected steps for the pipeline"
+    )
+
+class piplineresponse(BaseModel):
+    github_actions_yaml: str = Field(
+        ...,
+        description="Valid GitHub Actions workflow YAML (ready to save as .github/workflows/ci.yml)"
+        )
+    manual_instructions: str = Field(
+        ...,
+        description="Plain-text instructions for manual setup (secrets, permissions, etc.)"
+        )
+    suggestions: List[str] = Field(
+        default_factory=list,
+        description="Optional improvements or notes"
+        )
+
+@app.post('/finalpipeline')
+def final_pipeline(selection: PipelineGenerationRequest)-> piplineresponse:
+        llm = ChatGoogleGenerativeAI(
+        api_key="AIzaSyDjSMkvmTaesnYoeXQPs5T79iR2ba4mX9Q"
+        ,model="gemini-2.5-pro", temperature=0.1
+    )
+    
+        selection_str = selection
+    
+        prompt =[SystemMessage(content="You are a GitHub Actions expert. Generate a production-ready CI workflow YAML "
+            "and clear manual setup instructions. Output ONLY a JSON object with keys: "
+            "'github_actions_yaml', 'manual_instructions', and optionally 'suggestions'. "
+            "NO markdown, NO code blocks, NO extra text."),
+             HumanMessage(content= f"Generate a GitHub Actions pipeline based on this context:\n\n{selection_str}\n\n"
+            
+            "IMPORTANT: Output ONLY the JSON. No prefixes, no suffixes, no ```json.")]
+
+
+
+
+        res= llm.invoke(prompt)
+    
+        return res.content
