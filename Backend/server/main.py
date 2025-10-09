@@ -1,70 +1,30 @@
-from fastapi import FastAPI
-import requests
 import os
-import base64
-from typing import Dict ,List
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field, validator
-from typing import Dict, Optional
 import re
 import base64
-import requests
 import logging
-import os
-
-
+import requests
+from typing import Dict, List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 import json
 
-
-import re
-
-def extract_json_from_llm_output(text: str) -> dict:
-    """
-    Extracts JSON from a string that may be wrapped in Markdown code blocks.
-    Handles:
-      - ```json{...}```
-      - ```{...}```
-      - Plain {...}
-    """
-    # Remove Markdown code block wrappers
-    json_match = re.search(r"```(?:json)?\s*({.*})\s*```", text, re.DOTALL)
-    if json_match:
-        json_str = json_match.group(1)
-    else:
-        # Fallback: assume the whole string is JSON
-        json_str = text.strip()
-
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse LLM JSON output: {e}")
-
-
-# Optional: enable structured logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Optional: Define a Pydantic model for your LLM response (recommended!)
-class LLMAnalysisResponse(BaseModel):
-    project_analysis: dict
-    ci_pipeline_steps: list
 
 app = FastAPI(
     title="Repo Analyzer API",
     description="Securely analyze GitHub repository contents for CI/CD and dependency files.",
     version="1.0.0",
-    docs_url="/docs",  # Swagger UI
-    redoc_url="/redoc",  # ReDoc
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
-@app.get('/')
-def read_root():
-    return {"status": "200 OK", "message": "Welcome to Pipeline AI Backend Service"}
 
-
-
-# --- Input Model ---
+# ======================
+# MODEL DEFINITIONS
+# ======================
 class RepoAnalysisRequest(BaseModel):
     repo_url: str = Field(
         ...,
@@ -80,7 +40,7 @@ class RepoAnalysisRequest(BaseModel):
     )
     github_pat: str = Field(
         ...,
-        min_length=40,  # GitHub PATs are at least 40 chars
+        min_length=40,
         example="ghp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
         description="GitHub Personal Access Token with **read-only repo access**."
     )
@@ -97,36 +57,79 @@ class RepoAnalysisRequest(BaseModel):
         v = v.strip()
         if not v.startswith("https://github.com/"):
             raise ValueError("URL must be a valid GitHub HTTPS URL.")
-        # Match: https://github.com/owner/repo[.git]
         pattern = r"^https://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+?)(?:\.git)?$"
         if not re.match(pattern, v):
             raise ValueError("Invalid GitHub repository URL format.")
         return v
 
-# --- Helper: Parse owner/repo ---
+class TechItem(BaseModel):
+    name: str
+    version: str
+
+class ProjectAnalysisInput(BaseModel):
+    repo_url: str
+    branch: str
+    tech_stack: List[TechItem]
+    project_type: str
+    runtime_versions: List[TechItem]
+
+class PipelineStepInput(BaseModel):
+    id: str
+    name: str
+    description: str
+    category: str
+    default_command: str
+    optional: bool
+
+class PipelineGenerationRequest(BaseModel):
+    project_analysis: ProjectAnalysisInput
+    ci_pipeline_steps: List[PipelineStepInput] = Field(
+        ...,
+        description="User-selected steps for the pipeline"
+    )
+
+class GeneratedPipeline(BaseModel):
+    github_actions_yaml: str = Field(
+        ...,
+        description="Valid GitHub Actions workflow YAML (ready to save as .github/workflows/ci.yml)"
+    )
+    manual_instructions: str = Field(
+        ...,
+        description="Plain-text instructions for manual setup (secrets, permissions, etc.)"
+    )
+    suggestions: List[str] = Field(
+        default_factory=list,
+        description="Optional improvements or notes"
+    )
+
+# ======================
+# HELPER FUNCTIONS
+# ======================
 def parse_owner_repo(url: str) -> tuple[str, str]:
-    # Safe after validation
+    """Extract owner and repo name from GitHub URL."""
     parts = url.replace("https://github.com/", "").rstrip(".git").split("/")
     return parts[0], parts[1]
 
-# --- Constants ---
-RELEVANT_FILES = {
-    "common": {
-        "dockerfile", ".docker/dockerfile", "docker-compose.yml",
-        "jenkinsfile", ".gitlab-ci.yml", "azure-pipelines.yml",
-        ".circleci/config.yml", "readme.md"
-    },
-    "node": {"package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json"},
-    "python": {"requirements.txt", "pipfile", "pipfile.lock", "pyproject.toml", "poetry.lock"},
-    "java": {"pom.xml", "build.gradle", "settings.gradle", "gradlew", "gradlew.bat"}
-}
+def extract_json_from_llm_output(text: str) -> dict:
+    """Extract JSON from LLM output with Markdown code block handling."""
+    json_match = re.search(r"```(?:json)?\s*({.*?})\s*```", text, re.DOTALL)
+    json_str = json_match.group(1) if json_match else text.strip()
+    
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse LLM JSON output: {e}")
 
-LARGE_FILE_SUFFIXES = (".lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock")
+# ======================
+# ENDPOINTS
+# ======================
+@app.get('/')
+def read_root():
+    return {"status": "200 OK", "message": "Welcome to Pipeline AI Backend Service"}
 
-# --- Main Endpoint ---
 @app.post(
     "/analyze",
-    response_model=LLMAnalysisResponse,
+    response_model=dict,
     summary="Analyze GitHub repository contents",
     description="""
     Fetches and filters relevant CI/CD and dependency files from a GitHub repository.
@@ -147,11 +150,10 @@ def analyze_repo(request: RepoAnalysisRequest):
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "RepoAnalyzer/1.0"
     }
+    api_base = "https://api.github.com"
 
-    API_BASE = "https://api.github.com"
-
-    # Fetch repo tree
-    tree_url = f"{API_BASE}/repos/{owner}/{repo}/git/trees/{request.branch}?recursive=1"
+    # Fetch repository tree
+    tree_url = f"{api_base}/repos/{owner}/{repo}/git/trees/{request.branch}?recursive=1"
     try:
         tree_resp = requests.get(tree_url, headers=headers, timeout=10)
     except requests.RequestException as e:
@@ -166,34 +168,51 @@ def analyze_repo(request: RepoAnalysisRequest):
         logger.error(f"GitHub API error ({tree_resp.status_code}): {tree_resp.text}")
         raise HTTPException(status_code=502, detail="GitHub API returned an error")
 
+    # Process relevant files
     tree_data = tree_resp.json()
     file_paths = [item["path"] for item in tree_data.get("tree", []) if item["type"] == "blob"]
+    
+    RELEVANT_FILES = {
+        "common": {
+            "dockerfile", ".docker/dockerfile", "docker-compose.yml",
+            "jenkinsfile", ".gitlab-ci.yml", "azure-pipelines.yml",
+            ".circleci/config.yml", "readme.md"
+        },
+        "node": {"package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json"},
+        "python": {"requirements.txt", "pipfile", "pipfile.lock", "pyproject.toml", "poetry.lock"},
+        "java": {"pom.xml", "build.gradle", "settings.gradle", "gradlew", "gradlew.bat"}
+    }
+    
+    LARGE_FILE_SUFFIXES = (
+        ".lock", "package-lock.json", "yarn.lock", 
+        "pnpm-lock.yaml", "poetry.lock"
+    )
 
-    # Normalize and collect relevant files
     relevant_paths = set()
     for path in file_paths:
         lower_path = path.lower()
-        # Common files
         if lower_path in RELEVANT_FILES["common"]:
             relevant_paths.add(path)
-        # GitHub Actions
+            continue
+            
         if lower_path.startswith(".github/workflows/") and lower_path.endswith((".yml", ".yaml")):
             relevant_paths.add(path)
-        # Language-specific
+            continue
+            
         for lang_files in RELEVANT_FILES.values():
             if lower_path in lang_files or any(lower_path.endswith(f"/{f}") for f in lang_files):
                 relevant_paths.add(path)
+                break
 
     # Fetch and filter file contents
-    results: Dict[str, str] = {}
+    results = {}
     for filepath in relevant_paths:
-        content_url = f"{API_BASE}/repos/{owner}/{repo}/contents/{filepath}?ref={request.branch}"
+        content_url = f"{api_base}/repos/{owner}/{repo}/contents/{filepath}?ref={request.branch}"
         try:
             content_resp = requests.get(content_url, headers=headers, timeout=10)
+            if content_resp.status_code != 200:
+                continue
         except requests.RequestException:
-            continue  # skip on network error
-
-        if content_resp.status_code != 200:
             continue
 
         data = content_resp.json()
@@ -205,142 +224,147 @@ def analyze_repo(request: RepoAnalysisRequest):
         except (ValueError, UnicodeDecodeError):
             continue
 
-        # Smart filtering for large lockfiles
-        lower_fp = filepath.lower()
-        if any(lower_fp.endswith(suffix) for suffix in LARGE_FILE_SUFFIXES):
+        # Filter large lockfiles
+        if any(filepath.lower().endswith(suffix) for suffix in LARGE_FILE_SUFFIXES):
             lines = content.splitlines()
-            # Prioritize lines with versions or package identifiers
             important_lines = [
                 line for line in lines
                 if "version" in line.lower() or "@" in line or "resolved" in line.lower()
             ]
-            # Use important lines if available, else fallback to head
-            selected_lines = important_lines if important_lines else lines
-            content = "\n".join(selected_lines[:request.max_lines])
+            content = "\n".join(important_lines[:request.max_lines] or lines[:request.max_lines])
 
         results[filepath] = content
-  
 
+    # Build snapshot from all relevant files
+    snapshot = "\n\n".join(
+        f"File: {path}\n{content}" for path, content in results.items()
+    ) or "No relevant files found in repository"
+
+    # Prepare LLM prompt
+    repo_details = f"Repository: {request.repo_url}\nBranch: {request.branch}"
     
-    snapshot_str = content
-    
-
-
-    repodetails_str = "https://github.com/ubaimutl/react-portfolio.git master branch"
-    llm = ChatGoogleGenerativeAI(
-        api_key="AIzaSyDjSMkvmTaesnYoeXQPs5T79iR2ba4mX9Q"
-        ,model="gemini-2.5-pro", temperature=0.1
-    )
-
-
     prompt = [
-    SystemMessage(content=(
-        "You are an expert DevOps engineer specializing in CI pipeline generation. "
-        "strictly ci steps only."
-        "Your task is to analyze repository files and output a STRICTLY VALID JSON object with NO extra text, "
-        "markdown, or explanations. The output will be parsed programmatically for a drag-and-drop pipeline builder."
-    )),
-    HumanMessage(content=(
-        f"Analyze the following repository snapshot and details:\n\n"
-        f"--- REPOSITORY SNAPSHOT ---\n{snapshot_str}\n\n"
-        f"--- REPO METADATA ---\n{repodetails_str}\n\n"
-        "Generate a JSON object with EXACTLY these top-level keys:\n"
-        "1. `project_analysis`: Object with repo_url, branch should be as per the details provided, tech_stack (with versions), project_type, runtime_versions\n"
-        "2. `ci_pipeline_steps`: Array of step objects for drag-and-drop pipeline builder\n\n"
-        "RULES FOR `ci_pipeline_steps`:\n"
-        "- Each step MUST have: id (snake_case), name, description, category (Setup/Build/Test/Deploy/Optimization), default_command\n"
-        "- Each step MAY have: optional (boolean), make each step generic but the verison of packages must be included along with runtime versions can be aproxed just the steps are generic and this is just sekelton of steps and info to genrate the pipeline\n"
-        "- NO markdown, NO code blocks, NO extra fields\n"
-        "- list of the steps in order that is recommened for users clarity\n"
-        "- Commands must be executable in shell (e.g., 'npm ci', not 'Install dependencies')\n\n"
-        "OUTPUT FORMAT:\n"
-        "{\n"
-        "  \"project_analysis\": { ... },\n"
-        "  \"ci_pipeline_steps\": [\n"
-        "    {\n"
-        "      \"id\": \"string\",\n"
-        "      \"name\": \"string\",\n"
-        "      \"description\": \"string\",\n"
-        "      \"category\": \"string\",\n"
-        "      \"default_command\": \"string\",\n"
-        "      \"optional\": boolean,\n"
-       
-        "      }\n"
-        "    }\n"
-        "  ],\n"
-       "\n"
-        "IMPORTANT: Output ONLY the JSON object. NO prefixes, NO suffixes, NO ```json blocks."
-    ))
-        ]
+        SystemMessage(content=(
+            "You are an expert DevOps engineer specializing in CI pipeline generation. "
+            "Output ONLY a valid JSON object with NO extra text, markdown, or explanations. "
+            "The output will be parsed programmatically for a drag-and-drop pipeline builder."
+        )),
+        HumanMessage(content=(
+            f"Analyze the repository snapshot and meta\n\n"
+            f"--- REPOSITORY SNAPSHOT ---\n{snapshot}\n\n"
+            f"--- REPO METADATA ---\n{repo_details}\n\n"
+            "Generate a JSON object with EXACTLY these top-level keys:\n"
+            "1. `project_analysis`: Object with repo_url, branch, tech_stack (with versions), "
+            "project_type, runtime_versions\n"
+            "2. `ci_pipeline_steps`: Array of step objects for pipeline builder\n\n"
+            "RULES FOR `ci_pipeline_steps`:\n"
+            "- Each step MUST have: id (snake_case), name, description, category, default_command\n"
+            "- Commands must be executable in shell (e.g., 'npm ci')\n"
+            "- NO markdown, NO code blocks, NO extra fields\n"
+            "- Steps should be in logical order\n\n"
+            "IMPORTANT: Output ONLY the JSON object. NO prefixes, NO suffixes, NO ```json blocks."
+        ))
+    ]
 
-    response = llm.invoke(prompt)
-    print(response.content)
-    
-
-    return extract_json_from_llm_output(response.content)
-
-
-class TechItem(BaseModel):
-    name: str
-    version: str
-
-class ProjectAnalysisInput(BaseModel):
-    repo_url: str
-    branch: str
-    tech_stack: List[TechItem]
-    project_type: str
-    runtime_versions: List[TechItem]
-
-class PipelineStepInput(BaseModel):
-    id: str
-    name: str
-    description: str
-    category: str
-    default_command: str
-    optional: bool
-    # Note: platform_specific_plugins NOT needed here — we generate GitHub Actions only
-
-class PipelineGenerationRequest(BaseModel):
-    project_analysis: ProjectAnalysisInput
-    ci_pipeline_steps: List[PipelineStepInput] = Field(
-        ...,
-        description="User-selected steps for the pipeline"
-    )
-
-class piplineresponse(BaseModel):
-    github_actions_yaml: str = Field(
-        ...,
-        description="Valid GitHub Actions workflow YAML (ready to save as .github/workflows/ci.yml)"
-        )
-    manual_instructions: str = Field(
-        ...,
-        description="Plain-text instructions for manual setup (secrets, permissions, etc.)"
-        )
-    suggestions: List[str] = Field(
-        default_factory=list,
-        description="Optional improvements or notes"
-        )
-
-@app.post('/finalpipeline')
-def final_pipeline(selection: PipelineGenerationRequest)-> piplineresponse:
+    # Call LLM
+    try:
         llm = ChatGoogleGenerativeAI(
-        api_key="AIzaSyDjSMkvmTaesnYoeXQPs5T79iR2ba4mX9Q"
-        ,model="gemini-2.5-pro", temperature=0.1
+            api_key="AIzaSyDjSMkvmTaesnYoeXQPs5T79iR2ba4mX9Q",
+            model="gemini-2.5-pro",
+            temperature=0.1
+        )
+        response = llm.invoke(prompt)
+        return extract_json_from_llm_output(response.content)
+    except Exception as e:
+        logger.error(f"LLM processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to analyze repository")
+
+@app.post(
+    "/generate-pipeline",
+    response_model=GeneratedPipeline,
+    summary="Generate GitHub Actions pipeline",
+    description="Convert selected CI pipeline steps into a production-ready GitHub Actions workflow."
+)
+def generate_pipeline(request: PipelineGenerationRequest):
+    # Build context string
+    context = (
+        "Project Analysis:\n"
+        f"- Repo: {request.project_analysis.repo_url}\n"
+        f"- Branch: {request.project_analysis.branch}\n"
+        f"- Project Type: {request.project_analysis.project_type}\n"
+        f"- Tech Stack: {', '.join([f'{t.name} ({t.version})' for t in request.project_analysis.tech_stack])}\n"
+        f"- Runtime: {', '.join([f'{r.name} {r.version}' for r in request.project_analysis.runtime_versions])}\n\n"
+        "Selected CI Steps:\n"
     )
     
-        selection_str = selection
-    
-        prompt =[SystemMessage(content="You are a GitHub Actions expert. Generate a production-ready CI workflow YAML "
+    for step in request.ci_pipeline_steps:
+        context += (
+            f"- [{step.category}] {step.name}: {step.description}\n"
+            f"  Command: `{step.default_command}`\n"
+        )
+
+    # Prepare LLM prompt
+    prompt = [
+        SystemMessage(content=(
+            "You are a GitHub Actions expert. Generate a production-ready CI workflow YAML "
             "and clear manual setup instructions. Output ONLY a JSON object with keys: "
             "'github_actions_yaml', 'manual_instructions', and optionally 'suggestions'. "
-            "NO markdown, NO code blocks, NO extra text."),
-             HumanMessage(content= f"Generate a GitHub Actions pipeline based on this context:\n\n{selection_str}\n\n"
+            "NO markdown, NO code blocks, NO extra text."
+        )),
+        HumanMessage(content=(
+            f"Generate a GitHub Actions pipeline based on this context:\n\n{context}\n\n"
+            "Requirements:\n"
+            "1. Workflow name: 'CI'\n"
+            "2. Trigger: on push to the specified branch\n"
+            "3. Use ubuntu-latest runner\n"
+            "4. Each step must use the provided 'default_command'\n"
+            "5. For 'Setup Node.js', use actions/setup-node@v4 with correct version\n"
+            "6. For 'Checkout Code', use actions/checkout@v4\n"
+            "7. Install dependencies with 'npm ci'\n"
+            "8. If linting/test steps are included, run them\n"
+            "9. Build step must run 'npm run build'\n\n"
+            "Manual Instructions should include:\n"
+            "- Required secrets (e.g., if deploying)\n"
+            "- Repository permissions (e.g., Actions → General → 'Read and write permissions')\n"
+            "- Any file changes needed (e.g., add .github/workflows/ci.yml)\n\n"
+            "Suggestions may include:\n"
+            "- Caching node_modules\n"
+            "- Adding test coverage\n"
+            "- Enabling dependency updates\n\n"
+            "OUTPUT FORMAT (STRICT JSON):\n"
+            "{\n"
+            "  \"github_actions_yaml\": \"name: CI\\non:\\n  push:\\n    branches: [master]\\n...\",\n"
+            "  \"manual_instructions\": \"1. Go to Settings > Actions > General...\",\n"
+            "  \"suggestions\": [\"Add caching for node_modules\", \"Consider adding Playwright tests\"]\n"
+            "}\n\n"
+            "IMPORTANT: Output ONLY the JSON. No prefixes, no suffixes, no ```json."
+        ))
+    ]
+
+    # Call LLM
+    try:
+        llm = ChatGoogleGenerativeAI(
+            api_key="AIzaSyDjSMkvmTaesnYoeXQPs5T79iR2ba4mX9Q",
+            model="gemini-2.5-pro",
+            temperature=0.1
+        )
+        response = llm.invoke(prompt)
+        
+        # Handle empty response
+        if not response.content.strip():
+            raise ValueError("LLM returned empty response")
             
-            "IMPORTANT: Output ONLY the JSON. No prefixes, no suffixes, no ```json.")]
-
-
-
-
-        res= llm.invoke(prompt)
-    
-        return res.content
+        # Use the helper function to extract JSON (handles Markdown blocks)
+        parsed = extract_json_from_llm_output(response.content)
+        return GeneratedPipeline(
+            github_actions_yaml=parsed["github_actions_yaml"],
+            manual_instructions=parsed["manual_instructions"],
+            suggestions=parsed.get("suggestions", [])
+        )
+    except ValueError as e:
+        logger.error(f"JSON parsing failed: {str(e)}")
+        logger.error(f"Raw response: {response.content}")
+        raise HTTPException(status_code=500, detail="Failed to parse pipeline generation response")
+    except Exception as e:
+        logger.error(f"Pipeline generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate pipeline")
